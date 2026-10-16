@@ -10,6 +10,7 @@ import {
   queryBackoffSeconds,
   readSnapshot,
   runQueued,
+  runSimple,
   selectTierMajorStackDecision,
 } from "./policy.ts";
 import {
@@ -417,4 +418,126 @@ it("uses the specified retry floor and cap", () => {
   expect(queryBackoffSeconds(1, 1)).toBe(60);
   expect(queryBackoffSeconds(1, 2)).toBe(120);
   expect(queryBackoffSeconds(60, 4)).toBe(300);
+});
+
+describe("deadline", () => {
+  const deadline = { ...options, interval: 60, timeout: 5 };
+  function fakeClock() {
+    let now = 0;
+    const sleeps: number[] = [];
+    return {
+      sleeps,
+      elapsed: () => now,
+      clock: {
+        now: () => now,
+        observedAt: () => "2026-07-26T00:00:00.000Z",
+        async sleep(seconds: number) {
+          sleeps.push(seconds);
+          now += seconds;
+        },
+      },
+    };
+  }
+  function checksByRead(...lists: (typeof passingCheck)[]) {
+    let reads = 0;
+    return {
+      ...fakeReader(),
+      async checksFastPath() {
+        const make = lists[Math.min(reads++, lists.length - 1)];
+        return { kind: "checks" as const, checks: [make()] };
+      },
+    } satisfies GitHubReader;
+  }
+  const watchSingle = (
+    reader: GitHubReader,
+    time: ReturnType<typeof fakeClock>,
+    polling: PollingOptions
+  ) =>
+    runSimple({
+      dependencies: { reader, clock: time.clock, emit: () => {} },
+      contexts: [context(1)],
+      mode: "single",
+      statusOnly: false,
+      options: polling,
+    });
+
+  it("reports READY at the deadline when checks pass during the last wait", async () => {
+    const time = fakeClock();
+    const verdict = await watchSingle(
+      checksByRead(pendingCheck, passingCheck),
+      time,
+      deadline
+    );
+    expect(verdict.kind).toBe("READY");
+    expect(time.sleeps).toEqual([5]);
+    expect(time.elapsed()).toBe(5);
+  });
+
+  it("times out at the deadline when checks are still pending", async () => {
+    const time = fakeClock();
+    const verdict = await watchSingle(checksByRead(pendingCheck), time, deadline);
+    expect(verdict.kind).toBe("TIMEOUT");
+    expect(time.elapsed()).toBe(5);
+  });
+
+  it("caps the retry backoff at the deadline", async () => {
+    const time = fakeClock();
+    let reads = 0;
+    const reader = {
+      ...fakeReader(),
+      async checksFastPath() {
+        if (reads++ === 0)
+          throw new WatcherQueryError({
+            kind: "command-exit",
+            retryable: true,
+            detail: "gh exited 1",
+            code: 1,
+          });
+        return { kind: "checks" as const, checks: [passingCheck()] };
+      },
+    } satisfies GitHubReader;
+    const retries: number[] = [];
+    const verdict = await runSimple({
+      dependencies: {
+        reader,
+        clock: time.clock,
+        emit(progress) {
+          if (progress.kind === "RETRY") retries.push(progress.retryInSeconds);
+        },
+      },
+      contexts: [context(1)],
+      mode: "single",
+      statusOnly: false,
+      options: deadline,
+    });
+    expect(verdict.kind).toBe("READY");
+    expect(retries).toEqual([5]);
+    expect(time.sleeps).toEqual([5]);
+  });
+
+  it("times out a queued stack at the deadline", async () => {
+    const time = fakeClock();
+    const verdict = await runQueued({
+      dependencies: {
+        reader: checksByRead(pendingCheck),
+        clock: time.clock,
+        emit: () => {},
+      },
+      contexts: [context(1)],
+      options: deadline,
+    });
+    expect(verdict.kind).toBe("TIMEOUT");
+    expect(time.elapsed()).toBe(5);
+  });
+
+  it("keeps the full interval when no deadline is set", async () => {
+    const time = fakeClock();
+    const verdict = await watchSingle(
+      checksByRead(pendingCheck, passingCheck),
+      time,
+      { ...deadline, timeout: 0 }
+    );
+    expect(verdict.kind).toBe("READY");
+    expect(time.sleeps).toEqual([60]);
+  });
 });
