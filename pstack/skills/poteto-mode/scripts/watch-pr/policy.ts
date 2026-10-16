@@ -354,6 +354,15 @@ const deadlinePassed = (
   options: T.PollingOptions,
   now: number
 ): boolean => options.timeout > 0 && now - started >= options.timeout;
+const sleepWithinDeadline = (
+  started: number,
+  options: T.PollingOptions,
+  now: number,
+  seconds: number
+): number =>
+  options.timeout > 0
+    ? Math.min(seconds, Math.max(0, options.timeout - (now - started)))
+    : seconds;
 type StepResult<V> =
   | { readonly kind: "terminal"; readonly verdict: V }
   | {
@@ -380,9 +389,11 @@ async function pollUntilTerminal<V>(args: {
       failures += 1;
       if (!error.failure.retryable || failures >= args.options.maxQueryErrors)
         return statusQueryVerdict(args.stamp, failures, error.failure);
-      const retryInSeconds = queryBackoffSeconds(
-        args.options.interval,
-        failures
+      const retryInSeconds = sleepWithinDeadline(
+        started,
+        args.options,
+        args.dependencies.clock.now(),
+        queryBackoffSeconds(args.options.interval, failures)
       );
       args.dependencies.emit(
         args.stamp({
@@ -410,7 +421,14 @@ async function pollUntilTerminal<V>(args: {
         deadlinePassed(started, args.options, args.dependencies.clock.now())
       )
         return result.onDeadline();
-      await args.dependencies.clock.sleep(result.seconds);
+      await args.dependencies.clock.sleep(
+        sleepWithinDeadline(
+          started,
+          args.options,
+          args.dependencies.clock.now(),
+          result.seconds
+        )
+      );
     }
   }
 }
