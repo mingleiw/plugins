@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { type ChildProcess, execFile, type ExecFileException, spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -64,8 +64,11 @@ export function* fileLines(file: string) {
   }
 }
 
-const TLC_TOOL =
-  "http:tla2tools[url=https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar,checksum=sha256:936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88]@1.7.4";
+const TLC_VERSION = "1.7.4";
+const TLC_URL =
+  `https://github.com/tlaplus/tlaplus/releases/download/v${TLC_VERSION}/tla2tools.jar`;
+const TLC_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88";
+const TLC_TOOL = `http:tla2tools[url=${TLC_URL},checksum=sha256:${TLC_SHA256}]@${TLC_VERSION}`;
 const JAVA_TOOL = "java@temurin-25";
 export const PINNED_FLAGS = ["-workers", "1", "-fp", "0", "-lncheck", "final"];
 
@@ -190,6 +193,45 @@ const runToFiles = (
     });
   });
 
+const sha256Of = (file: string) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+
+export async function download(url: string, sha256: string, dest: string) {
+  if (fs.existsSync(dest) && sha256Of(dest) === sha256) return dest;
+  let response: Response;
+  try {
+    response = await fetch(url);
+  } catch (error) {
+    throw new Error(`Cannot download ${url}: ${messageOf(error)}`);
+  }
+  if (!response.ok) throw new Error(`Cannot download ${url}: HTTP ${response.status}`);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  const got = createHash("sha256").update(bytes).digest("hex");
+  if (got !== sha256) throw new Error(`${url} has sha256 ${got}, not ${sha256}.`);
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  const part = `${dest}.${randomBytes(6).toString("hex")}`;
+  fs.writeFileSync(part, bytes);
+  fs.renameSync(part, dest);
+  return dest;
+}
+
+async function tlcWithoutMise(cwd: string) {
+  const java = process.env.JAVA || "java";
+  const version = await runChild(java, ["-version"], { cwd, env: process.env });
+  if (version.error)
+    throw new Error(
+      `Cannot find TLC: mise is not installed, and ${java} does not run: ${version.error.message}\nInstall mise, or Java 11 or later. Or set TLA2TOOLS to the path of tla2tools.jar, and JAVA to a java binary.`,
+    );
+  const cache = process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
+  const dest = path.join(cache, "pstack-statechart", `tla2tools-${TLC_VERSION}.jar`);
+  try {
+    return { jar: await download(TLC_URL, TLC_SHA256, dest), java };
+  } catch (error) {
+    throw new Error(
+      `Cannot find TLC: mise is not installed, and ${messageOf(error)}\nInstall mise, or download ${TLC_URL} and set TLA2TOOLS to its path.`,
+    );
+  }
+}
+
 async function findTlc(cwd: string) {
   const { TLA2TOOLS, JAVA } = process.env;
   if (TLA2TOOLS) return { jar: TLA2TOOLS, java: JAVA || "java" };
@@ -198,6 +240,7 @@ async function findTlc(cwd: string) {
   const where = () =>
     Promise.all([mise("where", TLC_TOOL), mise("which", "java", "--tool", JAVA_TOOL)]);
   let found = await where();
+  if (found.some((r) => r.error?.code === "ENOENT")) return tlcWithoutMise(cwd);
   if (found.some((r) => r.status !== 0)) {
     const r = await mise("install", JAVA_TOOL, TLC_TOOL);
     if (r.status !== 0)
